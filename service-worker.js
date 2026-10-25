@@ -1,4 +1,4 @@
-const CACHE_NAME = "kotoba60-v2";
+const CACHE_NAME = "kotoba60-v3";
 const APP_ASSETS = [
   "./",
   "./index.html",
@@ -6,6 +6,8 @@ const APP_ASSETS = [
   "./app.js",
   "./manifest.webmanifest",
   "./app-icon.svg",
+  "./app-icon-192.png",
+  "./app-icon-512.png",
 ];
 
 self.addEventListener("install", (event) => {
