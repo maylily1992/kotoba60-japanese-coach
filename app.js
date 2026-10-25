@@ -1927,6 +1927,13 @@ window.addEventListener("beforeinstallprompt", (event) => {
   document.getElementById("install-button").hidden = false;
 });
 
+const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+const isStandalone =
+  window.matchMedia?.("(display-mode: standalone)").matches || navigator.standalone === true;
+if (isIOS && !isStandalone) {
+  document.getElementById("install-button").hidden = false;
+}
+
 document.getElementById("install-button").addEventListener("click", async () => {
   if (!deferredInstallPrompt) {
     showToast("iPhone 请在 Safari 中点击“分享”，再选择“添加到主屏幕”。");
