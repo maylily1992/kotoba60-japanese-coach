@@ -1,8 +1,9 @@
-const CACHE_NAME = "kotoba60-v4";
+const CACHE_NAME = "kotoba60-v6";
 const APP_ASSETS = [
   "./",
   "./index.html",
   "./styles.css",
+  "./grammar-data.js",
   "./scenes.js",
   "./app.js",
   "./manifest.webmanifest",

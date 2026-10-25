@@ -48,6 +48,14 @@ const DEFAULT_STATE = {
   },
   reviewQueue: [],
   dailyReadiness: {},
+  savedSentences: [],
+  notebookMode: "lesson",
+  chatMessages: [],
+  ai: {
+    endpoint: "",
+    model: "",
+    key: "",
+  },
 };
 
 let state = loadState();
@@ -64,6 +72,8 @@ let recordingChunks = [];
 let recordingStream = null;
 let recordingStart = 0;
 let session = createEmptySession();
+let chatBusy = false;
+let speechRecognition = null;
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
@@ -84,6 +94,10 @@ function loadState() {
       performance: Array.isArray(saved.performance) ? saved.performance : [],
       reviewQueue: Array.isArray(saved.reviewQueue) ? saved.reviewQueue : [],
       dailyReadiness: saved.dailyReadiness || {},
+      savedSentences: Array.isArray(saved.savedSentences) ? saved.savedSentences : [],
+      notebookMode: saved.notebookMode || "lesson",
+      chatMessages: Array.isArray(saved.chatMessages) ? saved.chatMessages : [],
+      ai: { ...DEFAULT_STATE.ai, ...(saved.ai || {}) },
     };
   } catch {
     return clone(DEFAULT_STATE);
@@ -150,6 +164,8 @@ function icon(name) {
     play: '<path d="M8 5v14l11-7z"/>',
     sound: '<path d="M5 9v6h4l5 4V5L9 9zm12 1a3 3 0 0 1 0 4m2-7a7 7 0 0 1 0 10"/>',
     light: '<path d="M9 18h6m-5 3h4M8.5 15.5A7 7 0 1 1 15.5 15.5c-.9.7-1.5 1.2-1.5 2.5h-4c0-1.3-.6-1.8-1.5-2.5z"/>',
+    star: '<path d="m12 3 2.8 5.7L21 9.6l-4.5 4.4 1.1 6.2-5.6-2.9-5.6 2.9 1.1-6.2L3 9.6l6.2-.9z"/>',
+    plus: '<path d="M12 5v14M5 12h14"/>',
     book: '<path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H11v16H6.5A2.5 2.5 0 0 0 4 21.5zm16 0A2.5 2.5 0 0 0 17.5 3H13v16h4.5a2.5 2.5 0 0 1 2.5 2.5z"/>',
     route: '<circle cx="6" cy="18" r="2"/><circle cx="18" cy="6" r="2"/><path d="M7.5 16.5 16.5 7.5M8 5h4M18 13v4"/>',
     brain: '<path d="M9 4a3 3 0 0 0-5 2.2A3 3 0 0 0 5 12a3 3 0 0 0 4 3.5V4Zm6 0a3 3 0 0 1 5 2.2A3 3 0 0 1 19 12a3 3 0 0 1-4 3.5V4Z"/><path d="M9 8H7m8 2h2m-8 5H7"/>',
@@ -183,6 +199,26 @@ function naturalAudio(scene, index) {
   return audioPath(scene.id, "n", index + 1);
 }
 
+function grammarModuleForScene(scene) {
+  return GRAMMAR_MODULES[(scene.id - 1) % GRAMMAR_MODULES.length];
+}
+
+function grammarModuleAudio(module, index) {
+  return `./audio/grammar-${module.id}-${index + 1}.mp3`;
+}
+
+function verbsForScene(scene) {
+  return (SCENE_VERB_IDS[scene.id - 1] || []).map((id) => VERB_BANK.find((verb) => verb.id === id)).filter(Boolean);
+}
+
+function verbAudio(verb) {
+  return `./audio/verb-${verb.id}.mp3`;
+}
+
+function verbForms(verb) {
+  return { ...verb.forms, ...(EXTRA_VERB_FORMS[verb.id] || {}) };
+}
+
 function readingLine(jp, kana, zh = "", audio = "", options = {}) {
   return `<div class="reading-line ${options.compact ? "compact" : ""}">
     <div class="reading-main">
@@ -192,6 +228,106 @@ function readingLine(jp, kana, zh = "", audio = "", options = {}) {
     </div>
     ${audio ? audioButton(audio, `播放：${jp}`) : ""}
   </div>`;
+}
+
+function sentenceKey(sceneId, type, index, extra = "") {
+  return `${sceneId}:${type}:${extra}:${index}`;
+}
+
+function isSentenceSaved(sceneId, type, index, extra = "") {
+  return state.savedSentences.some((item) => item.key === sentenceKey(sceneId, type, index, extra));
+}
+
+function bookmarkButton(scene, type, index, extra = "", label = "加入重点句") {
+  const saved = isSentenceSaved(scene.id, type, index, extra);
+  return `<button class="bookmark-button ${saved ? "is-saved" : ""}" type="button" data-action="toggle-save-sentence" data-scene-id="${scene.id}" data-type="${type}" data-index="${index}" data-extra="${escapeHtml(extra)}" aria-label="${escapeHtml(saved ? "从重点句移除" : label)}">
+    ${icon(saved ? "star" : "plus")}
+  </button>`;
+}
+
+function sentencePack(scene) {
+  const module = grammarModuleForScene(scene);
+  const verbs = verbsForScene(scene);
+  return [
+    ...scene.dialogue.map((line, index) => ({
+      type: "dialogue",
+      index,
+      extra: "",
+      jp: line.jp,
+      kana: line.kana,
+      zh: line.zh,
+      label: `场景对话 ${index + 1} · ${line.speaker}`,
+      audio: dialogueAudio(scene, index),
+    })),
+    ...scene.natural.map((item, index) => ({
+      type: "natural",
+      index,
+      extra: "",
+      jp: item.jp,
+      kana: item.kana,
+      zh: item.zh,
+      label: `地道反应 ${index + 1}`,
+      audio: naturalAudio(scene, index),
+    })),
+    ...scene.grammar.examples.map((example, index) => ({
+      type: "scene-grammar",
+      index,
+      extra: "",
+      jp: example.jp,
+      kana: example.kana,
+      zh: example.zh,
+      label: `今日语法 · ${scene.grammar.title}`,
+      audio: grammarAudio(scene),
+    })),
+    ...module.examples.map((example, index) => ({
+      type: "grammar-module",
+      index,
+      extra: module.id,
+      jp: example.jp,
+      kana: example.kana,
+      zh: example.zh,
+      label: `系统语法 · ${module.title}`,
+      audio: grammarModuleAudio(module, index),
+    })),
+    ...verbs.map((verb, index) => ({
+      type: "verb",
+      index,
+      extra: verb.id,
+      jp: verb.example.jp,
+      kana: verb.example.kana,
+      zh: verb.example.zh,
+      label: `动词实验室 · ${verb.word}`,
+      audio: verbAudio(verb),
+    })),
+  ];
+}
+
+function registerSentence(scene, type, index, extra = "") {
+  const key = sentenceKey(scene.id, type, index, extra);
+  const existingIndex = state.savedSentences.findIndex((item) => item.key === key);
+  if (existingIndex >= 0) {
+    state.savedSentences.splice(existingIndex, 1);
+    saveState();
+    showToast("已从重点句手册移除。");
+    return;
+  }
+  const sentence = sentencePack(scene).find(
+    (item) => item.type === type && item.index === Number(index) && item.extra === extra,
+  );
+  if (!sentence) return;
+  state.savedSentences.push({
+    ...sentence,
+    key,
+    sceneId: scene.id,
+    week: scene.week,
+    day: scene.day,
+    sceneTitle: scene.title,
+    createdAt: new Date().toISOString(),
+    reviewCount: 0,
+    lastReviewed: null,
+  });
+  saveState();
+  showToast("已加入重点句手册，可在“手册”里复习。");
 }
 
 function todayLabel() {
@@ -316,7 +452,7 @@ function renderHome() {
     <section class="hero-card">
       <div class="hero-topline">
         <p class="hero-kicker">DAY ${pad(scene.id)} · ${escapeHtml(scene.category)}</p>
-        <span class="time-badge">${icon("clock")} 60 分钟</span>
+        <span class="time-badge">${icon("clock")} 60 分钟 · 18+ 句</span>
       </div>
       <h2 class="hero-title">${escapeHtml(scene.title)}</h2>
       <p class="hero-subtitle">${escapeHtml(scene.place)}<br />${escapeHtml(scene.goal)}</p>
@@ -332,9 +468,13 @@ function renderHome() {
 
     <div class="sound-credit">
       <span class="sound-avatar">ハ</span>
-      <div><b>ハルト · 年轻日本男生声线</b><small>全部对话使用预生成音频，不再调用生硬的浏览器朗读</small></div>
+      <div><b>ハルト · 元气热血少年声线</b><small>高音、快节奏的日漫少年气质；不复制具体声优本人的声音</small></div>
       ${audioButton(dialogueAudio(scene, 0), "试听今日对话")}
     </div>
+    <button class="button indigo chat-launch" type="button" data-route="chat">
+      ${icon("mic")} 和ハルト实时对谈
+      <small>练完可以立刻反馈和追问</small>
+    </button>
 
     <div class="readiness-strip">
       <small>今天的状态</small>
@@ -384,7 +524,7 @@ function renderHome() {
     <section class="lesson-preview">
       <div class="lesson-preview-head">
         <span>${icon("book")}</span>
-        <div><b>${scene.words.length} 个词语 · 1 个语法 · 2 个注意点</b><small>每一项都有平假名注音和独立发音</small></div>
+        <div><b>${sentencePack(scene).length} 句 · ${scene.words.length} 词 · 3 个动词全变形</b><small>加入系统语法轨道、语体选择、注意点与地道用法</small></div>
       </div>
       <div class="word-chips">
         ${scene.words
@@ -490,7 +630,10 @@ function renderDialoguePhase(scene) {
             <div class="bubble revised-bubble">
               <div class="bubble-head">
                 <span class="bubble-speaker">${escapeHtml(line.speaker)}</span>
-                ${audioButton(dialogueAudio(scene, index), "播放这句", "bubble-speak")}
+                <span class="bubble-tools">
+                  ${bookmarkButton(scene, "dialogue", index)}
+                  ${audioButton(dialogueAudio(scene, index), "播放这句", "bubble-speak")}
+                </span>
               </div>
               <p>${escapeHtml(line.jp)}</p>
               <p class="kana-inline">${escapeHtml(line.kana)}</p>
@@ -654,7 +797,7 @@ function renderNaturalPhase(scene) {
       ${scene.natural
         .map(
           (item, index) => `<article class="natural-card">
-            <div class="natural-head">${icon("spark")}<span>地道反应 ${index + 1}</span></div>
+            <div class="natural-head">${icon("spark")}<span>地道反应 ${index + 1}</span>${bookmarkButton(scene, "natural", index)}</div>
             ${readingLine(item.jp, item.kana, item.zh, naturalAudio(scene, index))}
             <p>${escapeHtml(item.note)}</p>
           </article>`,
@@ -695,7 +838,12 @@ function summarySheet(scene) {
       <div class="summary-grammar">
         <p>${escapeHtml(scene.grammar.explain)}</p>
         ${scene.grammar.examples
-          .map((example) => readingLine(example.jp, example.kana, example.zh, grammarAudio(scene), { compact: true }))
+          .map(
+            (example, index) => `<div class="sentence-row">
+              ${readingLine(example.jp, example.kana, example.zh, grammarAudio(scene), { compact: true })}
+              ${bookmarkButton(scene, "scene-grammar", index)}
+            </div>`,
+          )
           .join("")}
         <div class="caution-note"><b>注意</b><p>${escapeHtml(scene.grammar.caution)}</p></div>
       </div>
@@ -710,7 +858,7 @@ function summarySheet(scene) {
         ${scene.natural
           .map(
             (item, index) => `<article class="natural-card compact-natural">
-              <span class="natural-label">NATURAL</span>
+              <div class="natural-head"><span class="natural-label">NATURAL</span>${bookmarkButton(scene, "natural", index)}</div>
               ${readingLine(item.jp, item.kana, item.zh, naturalAudio(scene, index), { compact: true })}
               <p>${escapeHtml(item.note)}</p>
             </article>`,
@@ -721,19 +869,95 @@ function summarySheet(scene) {
   </div>`;
 }
 
+function renderGrammarTrack(scene) {
+  const module = grammarModuleForScene(scene);
+  return `<article class="grammar-track-card">
+    <div class="grammar-track-head">
+      <span>系统语法轨道 ${GRAMMAR_MODULES.findIndex((item) => item.id === module.id) + 1}/16</span>
+      <b>${escapeHtml(module.title)}</b>
+    </div>
+    <p class="grammar-premise">${escapeHtml(module.premise)}</p>
+    <div class="grammar-example-list">
+      ${module.examples
+        .map(
+          (example, index) => `<div class="sentence-row">
+            ${readingLine(example.jp, example.kana, example.zh, grammarModuleAudio(module, index), { compact: true })}
+            ${bookmarkButton(scene, "grammar-module", index, module.id)}
+          </div>`,
+        )
+        .join("")}
+    </div>
+    <details class="form-guide">
+      <summary>什么时候用哪种形态？打开完整判断表</summary>
+      ${Object.entries(FORM_GUIDE)
+        .map(
+          ([key, item]) => `<div class="form-guide-row">
+            <b>${escapeHtml(item.label)}</b>
+            <p>${escapeHtml(item.use)}</p>
+            <small>注意：${escapeHtml(item.caution)}</small>
+          </div>`,
+        )
+        .join("")}
+    </details>
+    <details class="form-guide grammar-map">
+      <summary>查看 16 模块系统语法全景</summary>
+      ${GRAMMAR_MODULES.map(
+        (item, index) => `<div class="grammar-map-row ${item.id === module.id ? "is-current" : ""}">
+          <span>${String(index + 1).padStart(2, "0")}</span>
+          <div><b>${escapeHtml(item.title)}</b><p>${escapeHtml(item.premise)}</p></div>
+        </div>`,
+      ).join("")}
+    </details>
+  </article>`;
+}
+
+function renderVerbLab(scene) {
+  const verbs = verbsForScene(scene);
+  return `<section class="verb-lab">
+    <div class="section-heading"><h2>动词全形态实验室</h2><span class="pill indigo">每天 3 个</span></div>
+    ${verbs
+      .map(
+        (verb, index) => `<article class="verb-card">
+          <div class="verb-head">
+            <div><b>${escapeHtml(verb.word)}</b><span>${escapeHtml(verb.kana)} · ${escapeHtml(verb.group)} · ${escapeHtml(verb.meaning)}</span></div>
+            ${bookmarkButton(scene, "verb", index, verb.id)}
+          </div>
+          <div class="verb-example">
+            ${readingLine(verb.example.jp, verb.example.kana, verb.example.zh, verbAudio(verb), { compact: true })}
+          </div>
+          <div class="conjugation-grid">
+            ${Object.entries(verbForms(verb))
+              .map(
+                ([key, [jp, kana]]) => `<div>
+                  <small>${escapeHtml(FORM_GUIDE[key].label)}</small>
+                  <b>${escapeHtml(jp)}</b>
+                  <span>${escapeHtml(kana)}</span>
+                </div>`,
+              )
+              .join("")}
+          </div>
+        </article>`,
+      )
+      .join("")}
+  </section>`;
+}
+
 function renderSummaryPhase(scene) {
   return `
     <div class="complete-card compact-complete">
       <div class="complete-mark">${icon("check")}</div>
-      <h2>今天，真正带走四样东西</h2>
-      <p>词语、一个语法、两个注意点、两个地道反应。下次打开讲义也能继续复习。</p>
+      <h2>今天，带走一整包语言材料</h2>
+      <p>${sentencePack(scene).length} 句、6 个核心词、3 个动词全形态、系统语法与地道反应。重点句可以逐条加入手册。</p>
       <div class="complete-stats">
-        <div><strong>${scene.words.length}</strong><span>词语</span></div>
-        <div><strong>1</strong><span>核心语法</span></div>
-        <div><strong>2</strong><span>地道用法</span></div>
+        <div><strong>${sentencePack(scene).length}</strong><span>完整句</span></div>
+        <div><strong>${verbsForScene(scene).length}</strong><span>动词实验室</span></div>
+        <div><strong>${GRAMMAR_MODULES.length}</strong><span>语法轨道模块</span></div>
       </div>
     </div>
     ${summarySheet(scene)}
+    <div class="section-heading"><h2>系统语法 · 今日轨道</h2><span class="pill red">每天加练 6 句</span></div>
+    ${renderGrammarTrack(scene)}
+    ${renderVerbLab(scene)}
     <div class="reflection-block">
       <h3>今天最能直接用的一句</h3>
       <p>不看上方，先说出口，再记录你实际说出的内容。</p>
@@ -798,12 +1022,17 @@ function renderCourse() {
   </div>`;
 }
 
-function renderJournal() {
+function renderNotebook() {
   const scene = DAILY_SCENES.find((item) => item.week === journalWeek && item.day === journalDay) || currentScene();
   return `<div class="page">
-    <p class="eyebrow">DAILY NOTES</p>
-    <h1 class="page-title">今日讲义，<br />一句都没漏下。</h1>
-    <p class="page-lead">按周选择对话。每篇都整理词语、语法、注意点和地道用法，并有完整平假名与独立发音。</p>
+    <p class="eyebrow">DAILY NOTES & SENTENCE BOOK</p>
+    <h1 class="page-title">讲义与重点句，<br />整理成自己的册。</h1>
+    <p class="page-lead">每天 ${sentencePack(scene).length} 句学习材料。标记不熟的句子，之后集中复习，不让重点散落。</p>
+    <div class="notebook-mode-tabs">
+      <button class="${state.notebookMode === "lesson" ? "is-selected" : ""}" type="button" data-action="set-notebook-mode" data-mode="lesson">完整讲义</button>
+      <button class="${state.notebookMode === "saved" ? "is-selected" : ""}" type="button" data-action="set-notebook-mode" data-mode="saved">重点句 ${state.savedSentences.length}</button>
+    </div>
+    ${state.notebookMode === "saved" ? renderSavedNotebook() : `
     <div class="journal-week-tabs">
       ${Array.from({ length: 8 }, (_, index) => index + 1)
         .map((number) => `<button class="${journalWeek === number ? "is-selected" : ""}" type="button" data-action="select-journal-week" data-week="${number}">W${number}</button>`)
@@ -826,6 +1055,7 @@ function renderJournal() {
               <span>${escapeHtml(line.speaker)}</span>
               <p>${escapeHtml(line.jp)}</p>
               <small>${escapeHtml(line.kana)}</small>
+              ${bookmarkButton(scene, "dialogue", index)}
               ${audioButton(dialogueAudio(scene, index), "播放这句", "mini-audio")}
             </div>`,
           )
@@ -834,7 +1064,314 @@ function renderJournal() {
       <button class="button secondary" type="button" data-action="start-journal-scene" data-scene-id="${scene.id}">按一小时流程练这一天 ${icon("arrow")}</button>
     </article>
     ${summarySheet(scene)}
+    <div class="section-heading"><h2>系统语法 · 今日轨道</h2><span class="pill red">6 句加练</span></div>
+    ${renderGrammarTrack(scene)}
+    ${renderVerbLab(scene)}
+    `}
   </div>`;
+}
+
+function renderSavedNotebook() {
+  if (!state.savedSentences.length) {
+    return `<div class="empty-notebook">
+      <div class="empty-mark">${icon("star")}</div>
+      <h2>还没有重点句</h2>
+      <p>在对话、系统语法、地道表达或动词实验室里点“＋”，句子就会汇总到这里。</p>
+      <button class="button secondary" type="button" data-action="set-notebook-mode" data-mode="lesson">去挑几句</button>
+    </div>`;
+  }
+  const sorted = state.savedSentences
+    .slice()
+    .sort((a, b) => (a.reviewCount || 0) - (b.reviewCount || 0) || String(b.createdAt).localeCompare(String(a.createdAt)));
+  return `<div class="saved-toolbar">
+    <span>按“复习次数少 → 多”排列，最不熟的先出现</span>
+    <button type="button" data-action="copy-saved">复制全部</button>
+  </div>
+  <div class="saved-sentence-list">
+    ${sorted
+      .map(
+        (item) => `<article class="saved-sentence-card">
+          <div class="saved-meta"><span>DAY ${pad(item.sceneId)} · ${escapeHtml(item.label)}</span><b>${item.reviewCount || 0} 次复习</b></div>
+          ${readingLine(item.jp, item.kana, item.zh, item.audio)}
+          <div class="saved-actions">
+            ${!item.audio ? `<button type="button" data-action="speak-saved" data-key="${escapeHtml(item.key)}">播放</button>` : ""}
+            <button type="button" data-action="review-saved" data-key="${escapeHtml(item.key)}">${icon("check")} 复习一次</button>
+            <button type="button" data-action="remove-saved" data-key="${escapeHtml(item.key)}">移除</button>
+          </div>
+        </article>`,
+      )
+      .join("")}
+  </div>`;
+}
+
+function renderChat() {
+  const scene = currentScene();
+  const connected = Boolean(state.ai.endpoint && state.ai.model);
+  const partnerTurns = scene.dialogue.filter((line) => line.side === "partner");
+  return `<div class="page chat-page">
+    <p class="eyebrow">LIVE WITH HARUTO · ${escapeHtml(scene.title)}</p>
+    <h1 class="page-title">说完以后，<br />马上和ハルト对一轮。</h1>
+    <p class="page-lead">他会用自然日语接话；回答中的日语、假名和中文提示会同时保留。模型接口未配置时，会使用今天的预写场景继续，不会伪装成实时 AI。</p>
+    <div class="sound-credit chat-credit">
+      <span class="sound-avatar">ハ</span>
+      <div><b>ハルト · 元气热血少年声线</b><small>更接近日漫少年角色的高音与活力，不复制具体声优本人</small></div>
+      <span class="online-dot ${connected ? "is-online" : ""}">${connected ? "AI 在线" : "预写模式"}</span>
+    </div>
+    <div class="chat-scene-card">
+      <small>今日场景</small><p>${escapeHtml(scene.place)} · ${escapeHtml(scene.goal)}</p>
+      <button type="button" data-action="quick-chat" data-text="まず、今日の場面を一緒に練習しましょう。">跟我练这一场</button>
+      <button type="button" data-action="quick-chat" data-text="私の日本語で、不自然なところはありますか。">让我反馈</button>
+      <button type="button" data-action="quick-chat" data-text="もう少し難しい質問をしてください。">提高难度</button>
+    </div>
+    <div class="chat-message-list" id="chat-message-list">
+      ${
+        state.chatMessages.length
+          ? state.chatMessages.map((message, index) => renderChatMessage(message, index)).join("")
+          : `<div class="chat-bubble partner">
+              <div class="chat-bubble-head"><span>ハルト</span><small>まずは今日の場面から</small></div>
+              ${readingLine(partnerTurns[0].jp, partnerTurns[0].kana, partnerTurns[0].zh, dialogueAudio(scene, 0))}
+            </div>`
+      }
+      ${chatBusy ? `<div class="chat-typing">ハルトが返事を考えています…</div>` : ""}
+    </div>
+    <div class="chat-composer">
+      <button type="button" class="chat-mic" data-action="chat-mic" aria-label="语音输入">${icon("mic")}</button>
+      <textarea id="chat-input" placeholder="用日语回答；不会时先说「すみません、もう一度お願いします」"></textarea>
+      <button type="button" class="chat-send" data-action="send-chat" ${chatBusy ? "disabled" : ""}>${icon("arrow")}</button>
+    </div>
+    <div class="chat-actions">
+      <button type="button" data-action="clear-chat">清空本轮</button>
+      <button type="button" data-action="save-chat-tip">收藏最后一条提示</button>
+    </div>
+    <details class="ai-settings">
+      <summary>${connected ? "模型接口已连接" : "连接实时 AI 对谈"}</summary>
+      <label>接口地址（Chat Completions）<input id="ai-endpoint" value="${escapeHtml(state.ai.endpoint)}" placeholder="https://…/v1/chat/completions"></label>
+      <div class="ai-settings-grid">
+        <label>模型<input id="ai-model" value="${escapeHtml(state.ai.model)}" placeholder="模型名称"></label>
+        <label>API Key<input id="ai-key" type="password" value="${escapeHtml(state.ai.key)}" placeholder="可留空"></label>
+      </div>
+      <button class="button secondary" type="button" data-action="save-ai">保存接口</button>
+      <p>配置仅保存在本机浏览器。实时声音使用设备日语语音合成；课程例句使用预生成的统一少年声线。</p>
+    </details>
+  </div>`;
+}
+
+function renderChatMessage(message, index) {
+  if (message.role === "user") {
+    return `<div class="chat-bubble user">
+      <div class="chat-bubble-head"><span>你</span><small>${message.time ? new Date(message.time).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) : ""}</small></div>
+      <p>${escapeHtml(message.content)}</p>
+    </div>`;
+  }
+  if (message.jp) {
+    return `<div class="chat-bubble partner">
+      <div class="chat-bubble-head"><span>ハルト</span><span class="chat-bubble-tools"><button class="bubble-speak" type="button" data-action="speak-chat" data-index="${index}" aria-label="播放回复">${icon("sound")}</button>${bookmarkChatButton(index)}</span></div>
+      ${readingLine(message.jp, message.kana || "", message.zh || "", "", { compact: true })}
+      ${message.note ? `<div class="chat-note"><b>提示</b><p>${escapeHtml(message.note)}</p></div>` : ""}
+    </div>`;
+  }
+  return `<div class="chat-bubble partner"><div class="chat-bubble-head"><span>ハルト</span></div><p>${escapeHtml(message.content)}</p></div>`;
+}
+
+function bookmarkChatButton(index) {
+  const saved = state.savedSentences.some((item) => item.key === `chat:${index}`);
+  return `<button class="bookmark-button ${saved ? "is-saved" : ""}" type="button" data-action="save-chat-sentence" data-index="${index}">${icon(saved ? "star" : "plus")}</button>`;
+}
+
+function buildChatPrompt() {
+  const scene = currentScene();
+  const module = grammarModuleForScene(scene);
+  const verbs = verbsForScene(scene);
+  return `你是「ハルト」：20岁的日本男生，性格阳光、反应快，像热血日漫里的可靠朋友。你在陪中文母语者练日语，当前场景是「${scene.title}」（${scene.place}），目标是：${scene.goal}。
+
+必须使用自然、适合 N4–N3 学习者的日语，不说教科书腔。每次只回 1–2 个短句，并提出一个问题让对话继续。不要替用户完成整段对话。
+今天的系统语法是「${module.title}」；今天练习动词：${verbs.map((verb) => `${verb.word}（${verb.group}）`).join("、")}。
+
+严格遵守以下输出格式，不要增加其他标题：
+JP: 日语回复
+KANA: 整句平假名读音
+ZH: 中文意思
+NOTE: 如果用户上一句有明显错误，用中文只指出一处最影响自然度的修正；没有错误就写“自然，继续。”`;
+}
+
+function parseChatReply(raw) {
+  const text = String(raw || "").replace(/\r/g, "").trim();
+  const field = (name) => {
+    const match = text.match(new RegExp(`(?:^|\\n)${name}[:：]\\s*(.+)`, "i"));
+    return match ? match[1].trim() : "";
+  };
+  const jp = field("JP");
+  const kana = field("KANA");
+  const zh = field("ZH");
+  const note = field("NOTE");
+  return jp
+    ? { role: "assistant", jp, kana, zh, note, content: `${jp}\n${kana}\n${zh}\n${note}`, time: new Date().toISOString() }
+    : { role: "assistant", content: text, time: new Date().toISOString() };
+}
+
+function localChatTurn() {
+  const scene = currentScene();
+  const partnerLines = scene.dialogue.filter((line) => line.side === "partner");
+  const partnerCount = state.chatMessages.filter((message) => message.role === "assistant").length;
+  const line = partnerLines[partnerCount % partnerLines.length];
+  return {
+    role: "assistant",
+    jp: line.jp,
+    kana: line.kana,
+    zh: line.zh,
+    note: "当前是预写对谈。配置模型接口后，ハルト会根据你的实际回答继续追问。",
+    content: line.jp,
+    time: new Date().toISOString(),
+  };
+}
+
+async function sendChat(quickText = "") {
+  if (chatBusy) return;
+  const input = document.getElementById("chat-input");
+  const text = (quickText || input?.value || "").trim();
+  if (!text) return;
+  state.chatMessages.push({ role: "user", content: text, time: new Date().toISOString() });
+  chatBusy = true;
+  saveState();
+  render();
+  const list = document.getElementById("chat-message-list");
+  if (list) list.scrollTop = list.scrollHeight;
+
+  let reply;
+  if (state.ai.endpoint && state.ai.model) {
+    try {
+      const messages = [
+        { role: "system", content: buildChatPrompt() },
+        ...state.chatMessages.slice(-10).map((message) => ({
+          role: message.role,
+          content: message.jp
+            ? `JP: ${message.jp}\nKANA: ${message.kana || ""}\nZH: ${message.zh || ""}\nNOTE: ${message.note || ""}`
+            : message.content,
+        })),
+      ];
+      const response = await fetch(state.ai.endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(state.ai.key ? { Authorization: `Bearer ${state.ai.key}` } : {}),
+        },
+        body: JSON.stringify({ model: state.ai.model, messages, temperature: 0.8 }),
+      });
+      if (!response.ok) throw new Error(`接口返回 ${response.status}`);
+      const data = await response.json();
+      const raw =
+        data?.choices?.[0]?.message?.content ||
+        data?.output_text ||
+        data?.message?.content ||
+        "";
+      if (!raw) throw new Error("模型没有返回内容");
+      reply = parseChatReply(raw);
+    } catch (error) {
+      reply = localChatTurn();
+      reply.note = `实时接口失败（${error.message}）。这条先用预写场景继续。`;
+    }
+  } else {
+    reply = localChatTurn();
+  }
+  state.chatMessages.push(reply);
+  chatBusy = false;
+  state.chatMessages = state.chatMessages.slice(-100);
+  saveState();
+  render();
+  const newList = document.getElementById("chat-message-list");
+  if (newList) newList.scrollTop = newList.scrollHeight;
+}
+
+function speakBoy(text) {
+  if (!("speechSynthesis" in window) || !text) {
+    showToast("当前浏览器没有实时日语语音合成。");
+    return;
+  }
+  window.speechSynthesis.cancel();
+  const utterance = new SpeechSynthesisUtterance(String(text).replace(/【中文提示】[\s\S]*/, ""));
+  utterance.lang = "ja-JP";
+  utterance.rate = 1.04;
+  utterance.pitch = 1.32;
+  const voice = window.speechSynthesis.getVoices().find((item) => item.lang.toLowerCase().startsWith("ja"));
+  if (voice) utterance.voice = voice;
+  window.speechSynthesis.speak(utterance);
+}
+
+function saveChatSentence(index) {
+  const message = state.chatMessages[Number(index)];
+  if (!message?.jp) return;
+  const key = `chat:${index}`;
+  const existing = state.savedSentences.findIndex((item) => item.key === key);
+  if (existing >= 0) {
+    state.savedSentences.splice(existing, 1);
+    showToast("已从重点句手册移除。");
+  } else {
+    state.savedSentences.push({
+      key,
+      type: "chat",
+      jp: message.jp,
+      kana: message.kana || "",
+      zh: message.zh || "",
+      label: "实时对谈 · ハルト",
+      audio: "",
+      sceneId: currentScene().id,
+      week: currentScene().week,
+      day: currentScene().day,
+      sceneTitle: currentScene().title,
+      createdAt: new Date().toISOString(),
+      reviewCount: 0,
+      lastReviewed: null,
+    });
+    showToast("这句已加入重点句手册。");
+  }
+  saveState();
+  render();
+}
+
+function saveChatTip() {
+  const message = state.chatMessages.slice().reverse().find((item) => item.role === "assistant" && (item.jp || item.content));
+  if (!message) {
+    showToast("还没有可以收藏的提示。");
+    return;
+  }
+  if (message.jp) saveChatSentence(state.chatMessages.indexOf(message));
+  else showToast("这条回复没有配套假名，暂不收入重点句。");
+}
+
+function saveAiSettings() {
+  state.ai.endpoint = document.getElementById("ai-endpoint")?.value.trim() || "";
+  state.ai.model = document.getElementById("ai-model")?.value.trim() || "";
+  state.ai.key = document.getElementById("ai-key")?.value.trim() || "";
+  saveState();
+  render();
+  showToast(state.ai.endpoint && state.ai.model ? "实时对谈已配置。" : "已清除接口配置。");
+}
+
+function startSpeechInput() {
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!Recognition) {
+    showToast("当前浏览器不支持日语语音输入，请直接输入。");
+    return;
+  }
+  if (speechRecognition) {
+    speechRecognition.stop();
+    speechRecognition = null;
+    return;
+  }
+  speechRecognition = new Recognition();
+  speechRecognition.lang = "ja-JP";
+  speechRecognition.interimResults = false;
+  speechRecognition.onresult = (event) => {
+    const text = event.results[0][0].transcript;
+    const input = document.getElementById("chat-input");
+    if (input) input.value = text;
+    showToast(`听到：${text}`);
+  };
+  speechRecognition.onerror = () => showToast("语音输入没有成功，请再说一次或改用文字。");
+  speechRecognition.onend = () => {
+    speechRecognition = null;
+  };
+  speechRecognition.start();
 }
 
 function renderProgress() {
@@ -897,8 +1434,11 @@ function render() {
   document.querySelectorAll(".nav-item").forEach((button) => {
     button.classList.toggle("is-active", button.dataset.route === route);
   });
+  const notebookLabel = document.querySelector('[data-route="notebook"] span');
+  if (notebookLabel) notebookLabel.textContent = state.savedSentences.length ? `手册 ${state.savedSentences.length}` : "手册";
   if (route === "course") main.innerHTML = renderCourse();
-  else if (route === "journal") main.innerHTML = renderJournal();
+  else if (route === "notebook") main.innerHTML = renderNotebook();
+  else if (route === "chat") main.innerHTML = renderChat();
   else if (route === "progress") main.innerHTML = renderProgress();
   else if (route === "session") main.innerHTML = renderSession();
   else main.innerHTML = renderHome();
@@ -909,7 +1449,7 @@ function setRoute(nextRoute) {
   if (route === "session" && nextRoute !== "session") pauseTimer();
   route = nextRoute;
   if (nextRoute === "course") expandedWeek = state.week;
-  if (nextRoute === "journal") {
+  if (nextRoute === "notebook") {
     journalWeek = state.week;
     journalDay = state.day;
   }
@@ -1269,7 +1809,11 @@ document.addEventListener("click", (event) => {
     render();
   }
   if (action === "select-day") openSession(Number(target.dataset.week), Number(target.dataset.day), true);
-  if (action === "open-journal") setRoute("journal");
+  if (action === "open-journal") {
+    state.notebookMode = "lesson";
+    saveState();
+    setRoute("notebook");
+  }
   if (action === "select-journal-week") {
     journalWeek = Number(target.dataset.week);
     journalDay = 1;
@@ -1282,6 +1826,70 @@ document.addEventListener("click", (event) => {
   if (action === "start-journal-scene") {
     const scene = sceneById(target.dataset.sceneId);
     openSession(scene.week, scene.day, true);
+  }
+  if (action === "toggle-save-sentence") {
+    registerSentence(
+      sceneById(target.dataset.sceneId),
+      target.dataset.type,
+      Number(target.dataset.index),
+      target.dataset.extra || "",
+    );
+    render();
+  }
+  if (action === "set-notebook-mode") {
+    state.notebookMode = target.dataset.mode;
+    saveState();
+    render();
+  }
+  if (action === "review-saved") {
+    const item = state.savedSentences.find((sentence) => sentence.key === target.dataset.key);
+    if (item) {
+      item.reviewCount = (item.reviewCount || 0) + 1;
+      item.lastReviewed = new Date().toISOString();
+      saveState();
+      render();
+      showToast(`已复习 ${item.reviewCount} 次。`);
+    }
+  }
+  if (action === "remove-saved") {
+    state.savedSentences = state.savedSentences.filter((sentence) => sentence.key !== target.dataset.key);
+    saveState();
+    render();
+  }
+  if (action === "speak-saved") {
+    const item = state.savedSentences.find((sentence) => sentence.key === target.dataset.key);
+    if (item) speakBoy(item.jp);
+  }
+  if (action === "copy-saved") {
+    const text = state.savedSentences
+      .map((item) => `${item.jp}\n${item.kana}\n${item.zh}`)
+      .join("\n\n");
+    if (!navigator.clipboard?.writeText) {
+      showToast("当前浏览器不支持剪贴板复制。");
+    } else {
+      navigator.clipboard.writeText(text).then(
+        () => showToast("重点句已复制。"),
+        () => showToast("复制失败，请检查浏览器剪贴板权限。"),
+      );
+    }
+  }
+  if (action === "send-chat") sendChat();
+  if (action === "quick-chat") {
+    const text = target.dataset.text;
+    if (text) sendChat(text);
+  }
+  if (action === "speak-chat") {
+    const message = state.chatMessages[Number(target.dataset.index)];
+    if (message?.jp || message?.content) speakBoy(message.jp || message.content);
+  }
+  if (action === "save-chat-sentence") saveChatSentence(Number(target.dataset.index));
+  if (action === "save-chat-tip") saveChatTip();
+  if (action === "save-ai") saveAiSettings();
+  if (action === "chat-mic") startSpeechInput();
+  if (action === "clear-chat") {
+    state.chatMessages = [];
+    saveState();
+    render();
   }
   if (action === "record") toggleRecording();
   if (action === "reset-progress") resetProgress();
