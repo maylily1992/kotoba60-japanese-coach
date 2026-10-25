@@ -1,0 +1,21 @@
+{
+  "name": "口语六十 · 日语日常口语",
+  "short_name": "口语六十",
+  "description": "每天 60 分钟，练习在日本旅行和生活中真正用得上的日语口语。",
+  "lang": "zh-CN",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f7f3ea",
+  "theme_color": "#f7f3ea",
+  "categories": ["education", "travel"],
+  "icons": [
+    {
+      "src": "./app-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
